@@ -1,44 +1,85 @@
-# email_service.py  (backend folder mein, main.py ke saath rakho)
+import json
 import os
 import smtplib
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 MAIL_FROM = os.getenv("MAIL_FROM") or SMTP_USER
+MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "IntelliChat")
 APP_ENV = os.getenv("APP_ENV", "dev")
 
 
-def send_email(to: str, subject: str, text: str, html: str | None = None) -> bool:
-    """Email bhejta hai. True = gayi, False = nahi gayi (settings missing ya error)."""
-    if not (SMTP_USER and SMTP_PASSWORD):
-        print("EMAIL NOT CONFIGURED: SMTP_USER or SMTP_PASSWORD is empty in the running server")
+def _send_via_brevo(to: str, subject: str, text: str, html: str | None) -> bool:
+    """Send email via Brevo API. Returns True if successful, False otherwise.`"""
+    payload = {
+        "sender": {"name": MAIL_FROM_NAME, "email": MAIL_FROM},
+        "to": [{"email": to}],
+        "subject": subject,
+        "textContent": text,
+    }
+    if html:
+        payload["htmlContent"] = html
+
+    request = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "api-key": BREVO_API_KEY,
+            "content-type": "application/json",
+            "accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return 200 <= response.status < 300
+    except urllib.error.HTTPError as e:
+        return False
+    except Exception as e:
         return False
 
+
+def _send_via_smtp(to: str, subject: str, text: str, html: str | None) -> bool:
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = f"IntelliChat <{MAIL_FROM}>"
+    msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM}>"
     msg["To"] = to
     msg.set_content(text)
     if html:
         msg.add_alternative(html, subtype="html")
-
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.send_message(msg)
-        print("EMAIL SENT:", subject)          # subject only, never the link or password
         return True
     except Exception as e:
-        print("EMAIL FAILED:", type(e).__name__)   
+        print("EMAIL FAILED (SMTP):", type(e).__name__)   
         return False
+
+
+def send_email(to: str, subject: str, text: str, html: str | None = None) -> bool:
+    """Email bhejta hai. True = gayi, False = nahi gayi (settings missing ya error)."""
+    if BREVO_API_KEY and MAIL_FROM:
+        ok = _send_via_brevo(to, subject, text, html)
+    elif SMTP_USER and SMTP_PASSWORD:
+        ok = _send_via_smtp(to, subject, text, html)
+    else:
+        return False
+
+    if ok:
+        print("EMAIL SENT:", subject)          # subject only, never the link or password
+    return ok
 
 
 def _button_email(heading: str, intro: str, button_text: str, link: str, footer: str) -> str:
@@ -75,7 +116,6 @@ def send_reset_email(to: str, link: str) -> None:
         print("RESET LINK (dev only):", link)
 
 
-#for sending email to user when they sign up
 def send_verification_email(to: str, link: str) -> None:
     ok = send_email(
         to,
@@ -93,7 +133,3 @@ def send_verification_email(to: str, link: str) -> None:
     )
     if not ok and APP_ENV == "dev":
         print("VERIFY LINK (dev only):", link)
- 
-
-
-
