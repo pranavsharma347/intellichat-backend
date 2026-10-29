@@ -50,8 +50,10 @@ def chat_agent(state: ChatState) -> dict:
     "Reply in English by default. "
     "But if the user explicitly asks for a different language in their question, follow the user's request. "
     "Reply in plain text, no markdown formatting like ** or $$. "
-    "Keep answers short and to the point (under 120 words) unless the user asks for detail or an example."
+    # "Keep answers short and to the point (under 120 words) unless the user asks for detail or an example."
     "Reply in clean Markdown: short paragraphs, bullet lists for steps, and fenced code blocks (with the language) for code."
+    "Use web_search at most once per question, with one good combined query. "
+    "As soon as you get the search results, answer directly. Do not search again."
 
 ))
     

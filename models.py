@@ -12,6 +12,7 @@ class User(Base):
     password = Column(String, nullable=False)                  
     is_verified = Column(Boolean, default=False, nullable=False)      
     created_at = Column(DateTime, default=datetime.utcnow)
+    conversations = relationship("Conversation", cascade="all, delete-orphan")
 
 
 class Conversation(Base):

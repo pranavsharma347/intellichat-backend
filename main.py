@@ -1,8 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
-
 from fastapi import FastAPI, Depends, HTTPException
 from chat import run_chat_agent
-from database import Base, engine, get_db
+from database import Base, engine, get_db, SessionLocal
 import models
 import schema
 from sqlalchemy.orm import Session
@@ -19,6 +19,7 @@ from hashing import Hash
 import email_service
 import security
 from fastapi import BackgroundTasks
+from fastapi import status, Response
 
 load_dotenv()  
 
@@ -46,6 +47,9 @@ Base.metadata.create_all(bind=engine)   # when the app starts, create the tables
 
 llm=init_chat_model("gemini-3.5-flash-lite", model_provider="google_genai")
 
+title_executor = ThreadPoolExecutor(max_workers=4)
+
+
 
 def get_conversation_history(conversation_id: str, db: Session, limit: int = 10,user: models.User = Depends(oauth2.get_current_user)) -> list:
     """Last `limit` messages of a chat, oldest first, in the format the LLM expects."""
@@ -60,12 +64,6 @@ def get_conversation_history(conversation_id: str, db: Session, limit: int = 10,
     messages.reverse()   
     return [{"role": m.role, "content": m.content} for m in messages]
 
-
-
-# @app.post('/askQuestion') 
-# def ChatAPI(question:str):
-#     answer=run_chat_agent(question)
-#     return {"question": question, "answer": answer}
 
 @app.post("/users", status_code=201, response_model=schema.UserResponse,tags=["Users"], summary="Create an account")
 def create_user(request: schema.SignupRequest,background_tasks: BackgroundTasks,db: Session = Depends(get_db)):
@@ -85,29 +83,6 @@ def create_user(request: schema.SignupRequest,background_tasks: BackgroundTasks,
     background_tasks.add_task(email_service.send_verification_email, db_user.email, link)
     return db_user
 
-
-# @app.get("/users")
-# def get_all_users(db: Session = Depends(get_db),user: models.User = Depends(oauth2.get_current_user)):
-#     users = db.query(models.User).all()
-#     return users
-
-
-
-# @app.post("/conversations", tags=["Chats"], summary="Create an empty chat")
-# def create_conversation(request: schema.ConversationCreate, db: Session = Depends(get_db),user: models.User = Depends(oauth2.get_current_user)):
-#     """Create an empty chat for the logged-in user. The owner always comes from the login token, never from the request body."""
-#     # user = db.query(models.User).filter(models.User.email == request.user_email).first()
-#     # if not user:
-#     #     raise HTTPException(status_code=404, detail="User not found. Pehle user create karo.")
-
-#     db_conversation = models.Conversation(
-#         user_email=user.email,
-#         title=request.title,
-#     )
-#     db.add(db_conversation)
-#     db.commit()
-#     db.refresh(db_conversation)
-#     return db_conversation
 
 
 @app.patch("/conversations/{conversation_id}", response_model=schema.ConversationResponse,tags=["Chats"], summary="Rename a chat")
@@ -130,7 +105,7 @@ def rename_conversation(conversation_id: str, request: schema.ConversationUpdate
 def delete_conversation(conversation_id: str, db: Session = Depends(get_db),user: models.User = Depends(oauth2.get_current_user)):
     """Delete one of my chats together with all its messages. Returns 404 if the chat is not mine."""
 
-    conversation = db.query(models.Conversation).filter(models.Conversation.id == conversation_id).first()
+    conversation = db.query(models.Conversation).filter(models.Conversation.id == conversation_id,models.Conversation.user_email == user.email).first()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -152,16 +127,62 @@ def get_user_conversations(db: Session = Depends(get_db),user: models.User = Dep
     return conversations
 
 
+ 
+ 
+
+
+
+
+
 
 def generate_title(first_message: str) -> str:
     """Make a short, meaningful title from the first message of a chat."""
-    title_prompt = f"Summarize this message into a short 3-5 word title (no quotes, no punctuation): {first_message}.By default the title should be in english, but if the message is in a different language, then generate the title in that language."
+    # title_prompt = f"Summarize this message into a short 3-5 word title (no quotes, no punctuation): {first_message}.By default the title should be in english, but if the message is in a different language, then generate the title in that language."
+    title_prompt = (
+    "Write a short chat title of 3 to 5 words for the message below.\n"
+    "Rules:\n"
+    "- Use the SAME language and the SAME script as the message.\n"
+    "- If the message is Hindi written in English letters (Hinglish), write the title in Hinglish.\n"
+    "- If the message is in Devanagari, write the title in Devanagari.\n"
+    "- Use English only when the message is in English.\n"
+    "- Name the TOPIC of the message. Do not copy the question words.\n"
+    "- Skip filler words like kya, hai, hoti, samjhao, please, explain.\n"
+    "- No quotes, no punctuation. Reply with the title only.\n\n"
+    "Examples:\n"
+    "Message: mujhe python decorators samjhao -> Python decorators ki jaankari\n"
+    "Message: networking kya hoti hain ise samjhao -> Networking ki basic jaankari\n"
+    "Message: what is RAG -> RAG explained\n\n"
+    f"Message: {first_message}\n"
+    "Title:"
+)
     response = llm.invoke(title_prompt)   
     content = response.content
     #here content can be a list of dicts or a string, so we need to handle both cases because in database we can store only string
     if isinstance(content, list):
         content = content[0]["text"]
     return content.strip()
+
+
+
+
+def save_title_when_ready(conversation_id, future):
+    if future.exception() is not None:
+        print(f"[title] failed: {future.exception()!r}")
+        return
+    db = SessionLocal()        
+    try:
+        conversation = (
+            db.query(models.Conversation)
+            .filter(models.Conversation.id == conversation_id)
+            .first()
+        )
+        if conversation:
+            conversation.title = future.result()
+            db.commit()
+    finally:
+        db.close()
+
+     
 
 @app.post("/conversations/{conversation_id}/chat", tags=["AI Chat"],summary="Send a message and get the full answer")
 @traceable(name="chat_in_conversation")  
@@ -225,12 +246,13 @@ def get_conversation_messages(conversation_id: str, db: Session = Depends(get_db
 
 @app.post("/chat/new", response_model=schema.NewChatResponse,tags=["AI Chat"], summary="Start a new chat with its first message")
 @traceable(name="start_new_chat")
-def start_new_chat(request: schema.NewChatRequest, db: Session = Depends(get_db),user: models.User = Depends(oauth2.get_current_user)):
+def start_new_chat(request: schema.NewChatRequest,db: Session = Depends(get_db),user: models.User = Depends(oauth2.get_current_user)):
     """Create a chat, give it an AI-made title, save the first message and return the full answer."""
 
     user = db.query(models.User).filter(models.User.email == user.email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
 
     db_conversation = models.Conversation(
         user_email=user.email,
@@ -239,13 +261,13 @@ def start_new_chat(request: schema.NewChatRequest, db: Session = Depends(get_db)
     db.add(db_conversation)
     db.commit()
     db.refresh(db_conversation)
+    conversation_id = db_conversation.id
 
-    title = generate_title(request.content)
-    db_conversation.title = title
-    db.commit()
+
+    title_future = title_executor.submit(generate_title, request.content)
 
     user_message = models.Message(
-        conversation_id=db_conversation.id,
+        conversation_id=conversation_id,
         role="user",
         content=request.content,
     )
@@ -259,6 +281,18 @@ def start_new_chat(request: schema.NewChatRequest, db: Session = Depends(get_db)
     )
     db.add(ai_message)
     db.commit()
+    title="New Chat"  
+    try:
+        title = title_future.result(timeout=5)
+        db_conversation.title = title
+        db.commit()
+    except Exception:
+        if not title_future.done():
+            title_future.add_done_callback(
+                lambda f: save_title_when_ready(conversation_id, f)
+            )
+
+
     return {
         "conversation_id": db_conversation.id,
         "title": title,
@@ -289,3 +323,20 @@ def chat_stream(conversation_id: str, request: schema.MessageCreate, db: Session
         db.commit()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+
+@app.delete("/users/me",status_code=status.HTTP_204_NO_CONTENT,tags=["Users"],summary="Delete my account and all my chats")
+def delete_my_account(db: Session = Depends(get_db),user: models.User = Depends(oauth2.get_current_user)):
+    """Logged-in user apna account delete karta hai. Chats aur messages cascade se apne aap delete hote hain."""
+ 
+    user = db.query(models.User).filter(models.User.email == user.email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+ 
+    db.delete(user)      
+    db.commit()
+ 
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
